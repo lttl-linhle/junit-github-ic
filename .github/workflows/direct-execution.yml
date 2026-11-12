@@ -1,4 +1,4 @@
-name: AgileTest Sync
+name: Direct Execution - AgileTest Sync
 
 on:
   workflow_dispatch:
