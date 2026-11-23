@@ -1,0 +1,144 @@
+name: AgileTest Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      TEST_EXECUTION_KEY:
+        description: "Test Execution Key from Jira"
+        required: false
+        type: string
+
+      PROJECT_KEY:
+        description: "Project Key from Jira"
+        required: false
+        type: string
+
+env:
+  # IC: no token step. WEBTRIGGER_URL = "CI import endpoint" from Jira personal settings > AgileTest API Integration
+  WEBTRIGGER_URL: ${{ secrets.WEBTRIGGER_URL }}
+  CLIENT_ID: ${{ secrets.CLIENT_ID }}
+  CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+  PROJECT_KEY: ${{ inputs.PROJECT_KEY || vars.PROJECT_KEY }}
+  TEST_EXECUTION_KEY: ${{ inputs.TEST_EXECUTION_KEY }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  run-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: maven
+
+      - name: Execute Tests
+        id: run_tests
+        run: mvn test
+        continue-on-error: true
+
+      - name: Submit to AgileTest
+        id: submit_agiletest
+        if: always()
+        run: |
+          AUTH=(-H "x-agiletest-client-id: $CLIENT_ID" -H "x-agiletest-client-secret: $CLIENT_SECRET")
+
+          if [ -z "$WEBTRIGGER_URL" ] || [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ]; then
+            echo "WEBTRIGGER_URL, CLIENT_ID or CLIENT_SECRET is empty!"
+            exit 1
+          fi
+
+          if [ -z "$PROJECT_KEY" ]; then
+            echo "PROJECT_KEY is empty!"
+            exit 1
+          fi
+
+          if [ -z "$TEST_EXECUTION_KEY" ]; then
+            echo "TEST_EXECUTION_KEY is empty!"
+            exit 1
+          fi
+
+          UPLOAD_FAILED=0
+          FILE_FOUND=0
+          INDEX=0
+
+          if [ ! -d "target/surefire-reports" ]; then
+            echo "Directory target/surefire-reports does not exist."
+            exit 1
+          fi
+
+          while IFS= read -r -d '' FILE; do
+            FILE_FOUND=1
+            INDEX=$((INDEX + 1))
+            # one unique requestId per file (re-runs get a new GITHUB_RUN_ATTEMPT)
+            REQUEST_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${INDEX}"
+
+            echo "Uploading: $FILE (requestId $REQUEST_ID)"
+
+            HTTP_CODE=$(curl -s -o response.json -w '%{http_code}' -X POST \
+              "$WEBTRIGGER_URL?action=import&framework=junit&projectKey=$PROJECT_KEY&testExecutionKey=$TEST_EXECUTION_KEY&requestId=$REQUEST_ID" \
+              "${AUTH[@]}" \
+              -H "Content-Type: application/xml" \
+              --data-binary "@$FILE")
+
+            # 202 = still processing: poll the import status (max 5 minutes)
+            for i in $(seq 1 30); do
+              [ "$HTTP_CODE" != "202" ] && break
+              sleep 10
+              HTTP_CODE=$(curl -s -o response.json -w '%{http_code}' \
+                "$WEBTRIGGER_URL?action=status&projectKey=$PROJECT_KEY&requestId=$REQUEST_ID" "${AUTH[@]}")
+            done
+
+            echo "Response ($HTTP_CODE): $(cat response.json)"
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "Upload FAILED for $FILE"
+              UPLOAD_FAILED=1
+            fi
+
+          done < <(find target/surefire-reports -name "TEST-*.xml" -print0)
+
+          if [ "$FILE_FOUND" -eq 0 ]; then
+            echo "No JUnit XML files found in target/surefire-reports."
+            exit 1
+          fi
+
+          if [ "$UPLOAD_FAILED" -eq 1 ]; then
+            echo "One or more uploads failed."
+            exit 1
+          fi
+
+          echo "All uploads successful."
+
+      - name: Update Pipeline Status
+        if: always()
+        env:
+          UPLOAD_RESULT: ${{ steps.submit_agiletest.outcome }}
+        run: |
+          if [ "$UPLOAD_RESULT" = "success" ]; then
+            RESULT="success"
+          else
+            RESULT="failed"
+          fi
+
+          echo "Upload outcome: $UPLOAD_RESULT"
+          echo "Pipeline result: $RESULT"
+
+          # IC (tool github) needs "repository" and "runId" (string); other fields are ignored
+          HTTP_CODE=$(curl -s -o response.json -w '%{http_code}' -X POST \
+            "$WEBTRIGGER_URL?action=pipeline-log&projectKey=$PROJECT_KEY&testExecutionKey=$TEST_EXECUTION_KEY" \
+            -H "x-agiletest-client-id: $CLIENT_ID" -H "x-agiletest-client-secret: $CLIENT_SECRET" \
+            -H "Content-Type: application/json" \
+            --data "{\"tool\":\"github\",\"result\":\"$RESULT\",\"repository\":\"$GITHUB_REPOSITORY\",\"runId\":\"$GITHUB_RUN_ID\"}")
+
+          echo "Pipeline update response ($HTTP_CODE): $(cat response.json)"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Failed to update pipeline status."
+            exit 1
+          fi
